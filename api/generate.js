@@ -1,22 +1,34 @@
-import { BG } from "bgutils-js";
-import { JSDOM } from "jsdom";
-import { Innertube } from "youtubei.js";
-
 const VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
 const COPYRIGHT = "© XyncTeam - 2026";
 const REQUEST_KEY = "O43z0dpjhgX20SCx4KAo";
 const CACHE_TTL_MS = Number(process.env.POT_CACHE_TTL_MS || 30 * 60 * 1000);
 
-const dom = new JSDOM("<!doctype html><html><body></body></html>", {
-  url: "https://www.youtube.com/",
-});
-Object.assign(globalThis, {
-  window: dom.window,
-  document: dom.window.document,
-});
-
 const tokenCache = new Map();
 let generationQueue = Promise.resolve();
+let runtimePromise = null;
+
+async function getRuntime() {
+  if (!runtimePromise) {
+    runtimePromise = Promise.all([
+      import("bgutils-js"),
+      import("jsdom"),
+      import("youtubei.js"),
+    ]).then(([bgutils, jsdom, youtubei]) => {
+      const dom = new jsdom.JSDOM("<!doctype html><html><body></body></html>", {
+        url: "https://www.youtube.com/",
+      });
+      Object.assign(globalThis, {
+        window: dom.window,
+        document: dom.window.document,
+      });
+      return {
+        BG: bgutils.BG,
+        Innertube: youtubei.Innertube,
+      };
+    });
+  }
+  return runtimePromise;
+}
 
 function enqueue(task) {
   const current = generationQueue.then(task, task);
@@ -25,6 +37,7 @@ function enqueue(task) {
 }
 
 async function createVisitorData() {
+  const { Innertube } = await getRuntime();
   const innertube = await Innertube.create({
     retrieve_player: false,
     enable_session_cache: false,
@@ -35,6 +48,7 @@ async function createVisitorData() {
 }
 
 async function mintContentPoToken(videoId) {
+  const { BG } = await getRuntime();
   const bgConfig = {
     fetch: (input, init) => fetch(input, init),
     globalObj: globalThis,
