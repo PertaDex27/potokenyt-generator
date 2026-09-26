@@ -4,10 +4,6 @@
     "api/generate.js": {
       "maxDuration": 60,
       "memory": 1024
-    },
-    "api/mailtm.js": {
-      "maxDuration": 30,
-      "memory": 512
     }
   },
   "rewrites": [
