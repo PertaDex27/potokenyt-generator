@@ -1,162 +1,141 @@
-const chromium = require("@sparticuz/chromium");
-const puppeteer = require("puppeteer-core");
+import { BG } from "bgutils-js";
+import { JSDOM } from "jsdom";
+import { Innertube } from "youtubei.js";
 
 const VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
 const COPYRIGHT = "© XyncTeam - 2026";
+const REQUEST_KEY = "O43z0dpjhgX20SCx4KAo";
+const CACHE_TTL_MS = Number(process.env.POT_CACHE_TTL_MS || 30 * 60 * 1000);
 
-let browserPromise = null;
+const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+  url: "https://www.youtube.com/",
+});
+Object.assign(globalThis, {
+  window: dom.window,
+  document: dom.window.document,
+});
 
-async function getBrowser() {
-  if (!browserPromise) {
-    browserPromise = puppeteer.launch({
-      args: [
-        ...chromium.args,
-        "--disable-web-security",
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--no-sandbox",
-      ],
-      defaultViewport: chromium.defaultViewport,
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
-    });
-  }
-  return browserPromise;
+const tokenCache = new Map();
+let generationQueue = Promise.resolve();
+
+function enqueue(task) {
+  const current = generationQueue.then(task, task);
+  generationQueue = current.catch(() => {});
+  return current;
+}
+
+async function createVisitorData() {
+  const innertube = await Innertube.create({
+    retrieve_player: false,
+    enable_session_cache: false,
+  });
+  const visitorData = innertube.session?.context?.client?.visitorData;
+  if (!visitorData) throw new Error("YouTube tidak mengembalikan visitorData");
+  return visitorData;
+}
+
+async function mintContentPoToken(videoId) {
+  const bgConfig = {
+    fetch: (input, init) => fetch(input, init),
+    globalObj: globalThis,
+    identifier: videoId,
+    requestKey: REQUEST_KEY,
+  };
+  const challenge = await BG.Challenge.create(bgConfig);
+  if (!challenge) throw new Error("BotGuard challenge tidak tersedia");
+
+  const interpreter =
+    challenge.interpreterJavascript
+      ?.privateDoNotAccessOrElseSafeScriptWrappedValue;
+  if (!interpreter) throw new Error("BotGuard VM tidak tersedia");
+  new Function(interpreter)();
+
+  const result = await BG.PoToken.generate({
+    program: challenge.program,
+    globalName: challenge.globalName,
+    bgConfig,
+  });
+  if (!result?.poToken) throw new Error("BotGuard gagal membuat poToken");
+
+  return {
+    poToken: result.poToken,
+    placeholderPoToken: BG.PoToken.generatePlaceholder(videoId),
+    tokenTtlSeconds:
+      Number(result.integrityTokenData?.estimatedTtlSecs) || null,
+  };
 }
 
 async function generateTokens(videoId) {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  const cached = tokenCache.get(videoId);
+  if (cached && Date.now() < cached.cacheExpiresAt) return cached.value;
 
-  let capturedVisitorData = null;
-  let capturedPoToken = null;
-
-  try {
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    );
-
-    await page.setRequestInterception(true);
-
-    page.on("request", (request) => {
-      const reqUrl = request.url();
-      const headers = request.headers();
-
-      if (!capturedVisitorData && headers["x-goog-visitor-id"]) {
-        capturedVisitorData = headers["x-goog-visitor-id"];
-      }
-
-      if (!capturedPoToken && reqUrl.includes("youtubei/v1/player")) {
-        try {
-          const postData = request.postData();
-          if (postData) {
-            const body = JSON.parse(postData);
-            const poToken = body?.serviceIntegrityDimensions?.poToken;
-            if (poToken) capturedPoToken = poToken;
-          }
-        } catch (_) {}
-      }
-
-      request.continue().catch(() => {});
-    });
-
-    await page.goto(`https://www.youtube.com/embed/${videoId}`, {
-      waitUntil: "domcontentloaded",
-      timeout: 45000,
-    });
-
-    await page
-      .evaluate(() => {
-        const video = document.querySelector("video");
-        if (video) {
-          video.muted = true;
-          video.play().catch(() => {});
-        }
-      })
-      .catch(() => {});
-
-    const startTime = Date.now();
-    while (!capturedPoToken && Date.now() - startTime < 30000) {
-      await new Promise((r) => setTimeout(r, 500));
+  return enqueue(async () => {
+    const secondCheck = tokenCache.get(videoId);
+    if (secondCheck && Date.now() < secondCheck.cacheExpiresAt) {
+      return secondCheck.value;
     }
 
-    if (!capturedPoToken || !capturedVisitorData) {
-      const result = await page
-        .evaluate(() => {
-          return {
-            visitorData:
-              window.ytcfg?.get?.("VISITOR_DATA") ||
-              window.ytcfg?.data_?.VISITOR_DATA ||
-              null,
-            poToken:
-              window.ytcfg?.get?.("PO_TOKEN") ||
-              window.ytcfg?.data_?.PO_TOKEN ||
-              null,
-          };
-        })
-        .catch(() => ({}));
-
-      if (!capturedVisitorData && result.visitorData) capturedVisitorData = result.visitorData;
-      if (!capturedPoToken && result.poToken) capturedPoToken = result.poToken;
-    }
-
-    return {
+    const [visitorData, token] = await Promise.all([
+      createVisitorData(),
+      mintContentPoToken(videoId),
+    ]);
+    const value = {
       videoId,
-      visitorData: capturedVisitorData,
-      poToken: capturedPoToken,
+      visitorData,
+      poToken: token.poToken,
+      playerPoToken: token.poToken,
+      placeholderPoToken: token.placeholderPoToken,
+      tokenType: "content_bound",
+      tokenTtlSeconds: token.tokenTtlSeconds,
+      generatedAt: new Date().toISOString(),
     };
-  } finally {
-    await page.close().catch(() => {});
-  }
+
+    tokenCache.set(videoId, {
+      value,
+      cacheExpiresAt: Date.now() + CACHE_TTL_MS,
+    });
+    if (tokenCache.size > 100) tokenCache.delete(tokenCache.keys().next().value);
+    return value;
+  });
 }
 
-module.exports = async (req, res) => {
+function sendJson(res, status, payload) {
+  res.status(status);
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.json(status < 400 ? { copyright: COPYRIGHT, ...payload } : payload);
+}
+
+export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (!/^(GET|POST)$/.test(req.method || "")) {
+    return sendJson(res, 405, {
+      success: false,
+      error: "Method tidak diizinkan. Gunakan GET atau POST.",
+    });
   }
 
-  const videoId =
-    (req.query && req.query.video) ||
-    (req.body && req.body.video) ||
-    "dQw4w9WgXcQ";
-
+  const videoId = String(
+    req.query?.video || req.body?.video || "dQw4w9WgXcQ",
+  ).trim();
   if (!VIDEO_ID_PATTERN.test(videoId)) {
-    return res.status(400).json({
-      copyright: COPYRIGHT,
+    return sendJson(res, 400, {
       success: false,
-      error: "Video ID tidak valid",
+      error: "Video ID tidak valid.",
     });
   }
 
   try {
     const result = await generateTokens(videoId);
-
-    if (!result.poToken && !result.visitorData) {
-      return res.status(502).json({
-        copyright: COPYRIGHT,
-        success: false,
-        error: "Gagal generate token (BotGuard gak trigger)",
-        videoId: result.videoId,
-      });
-    }
-
-    return res.status(200).json({
-      copyright: COPYRIGHT,
-      success: true,
-      videoId: result.videoId,
-      visitorData: result.visitorData,
-      poToken: result.poToken,
-      generated_at: new Date().toISOString(),
-    });
-  } catch (err) {
-    return res.status(500).json({
-      copyright: COPYRIGHT,
+    return sendJson(res, 200, { success: true, ...result });
+  } catch (error) {
+    return sendJson(res, 502, {
       success: false,
-      error: err.message || "Internal error",
+      error: error?.message || "Gagal membuat poToken dan visitorData.",
     });
   }
-};
+}
